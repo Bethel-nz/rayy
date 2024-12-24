@@ -7,8 +7,7 @@ A lightweight WebSocket relay server built with Go that allows real-time message
 - Acts as a message relay between WebSocket clients
 - Supports multiple chat rooms
 - Handles custom events (typing, join/leave)
-- No authentication required - just connect and chat
-- Provides both web and CLI clients
+- No authentication required
 
 
 ## Installation
