@@ -154,7 +154,7 @@ class ChatClient:
             print("\nConnecting to chat server...")
             
             # Register event handlers
-            self.register_event("typing", self.handle_typing_event)
+            self.register_event("typing", self.handle_typing_event) # tried handling this,might work in web version
             self.register_event("join", lambda m: print(f"\r\033[95m{m['from']} joined the room\033[0m"))
             self.register_event("leave", lambda m: print(f"\r\033[95m{m['from']} left the room\033[0m"))
             self.register_event("users", lambda m: print(f"\rUsers in room: {', '.join(m['data']['users'])}"))
