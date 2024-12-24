@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1.0">
+	<title>Simple Chat</title>
+
+	<!-- Tailwind CSS -->
+	<script src="https://cdn.tailwindcss.com"></script>
+
+	<!-- Alpine.js -->
+	<script defer src="https://unpkg.com/alpinejs@3.x.x/dist/cdn.min.js"></script>
+
+	<!-- App JS -->
+	<script src="https://unpkg.com/htmx.org@1.9.10"></script>
+
+	<link href="./style.css" rel="stylesheet">
+</head>
+
+<body class="bg-gray-100 h-screen">
+	<div x-data="chat" class="h-full">
+		<!-- Join/Create Room Panel -->
+		<div x-show="!connected" class="flex items-center justify-center h-full">
+			<div class="w-96 bg-white rounded-lg shadow p-6">
+				<h2 class="text-2xl font-bold mb-4">Simple Chat</h2>
+				
+				<form @submit.prevent="joinRoom" class="space-y-4">
+					<div>
+						<label class="block text-sm font-medium text-gray-700">Your Name</label>
+						<input type="text" x-model="username" required
+							class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 py-1.5 px-2">
+					</div>
+					<div>
+						<label class="block text-sm font-medium text-gray-700">Room ID</label>
+						<input type="text" x-model="roomId" required
+							class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 py-1.5 px-2"
+							:placeholder="'Enter room ID or leave empty to create new'">
+					</div>
+					<button type="submit"
+						class="w-full py-2 px-4 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700">
+						<span x-text="roomId ? 'Join Room' : 'Create Room'"></span>
+					</button>
+				</form>
+			</div>
+		</div>
+
+		<!-- Chat Interface -->
+		<div x-show="connected" class="h-full flex flex-col bg-white">
+			<!-- Chat Header -->
+			<div class="p-4 border-b bg-indigo-600 text-white">
+				<div class="flex justify-between items-center">
+					<div>
+						<h2 class="text-xl font-semibold">Room: <span x-text="roomId"></span></h2>
+						<p class="text-sm">Connected as: <span x-text="username"></span></p>
+					</div>
+					<button @click="leaveRoom"
+						class="px-4 py-2 bg-red-500 text-white rounded-lg hover:bg-red-600">
+						Leave
+					</button>
+				</div>
+			</div>
+
+			<!-- Messages Area -->
+			<div class="flex-1 overflow-y-auto p-4 space-y-4 message-container" x-ref="messageContainer">
+				<template x-for="message in messages" :key="message.timestamp">
+					<div :class="message.from === username ? 'message-bubble sent' : 'message-bubble received'">
+						<div class="flex items-baseline space-x-2">
+							<span x-text="message.from" class="font-semibold text-sm"></span>
+							<span x-text="formatTime(message.timestamp)" class="text-xs text-gray-500"></span>
+						</div>
+						<p x-text="message.content" class="mt-1"></p>
+					</div>
+				</template>
+			</div>
+
+			<!-- Message Input -->
+			<div class="p-4 border-t">
+				<form @submit.prevent="sendMessage" class="flex space-x-2">
+					<input type="text" x-model="newMessage"
+						class="flex-1 rounded-lg border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 px-2"
+						placeholder="Type your message...">
+					<button type="submit"
+						class="px-4 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700">
+						Send
+					</button>
+				</form>
+			</div>
+		</div>
+	</div>
+
+	<script>
+		document.addEventListener('alpine:init', () => {
+			Alpine.data('chat', () => ({
+				connected: false,
+				socket: null,
+				messages: [],
+				roomId: '',
+				username: '',
+				newMessage: '',
+
+				joinRoom() {
+					if (!this.username) return;
+					
+					// Generate room ID if not provided
+					if (!this.roomId) {
+						this.roomId = 'room_' + Math.random().toString(36).substr(2, 9);
+					}
+
+					// Connect to WebSocket
+					const wsUrl = `ws://localhost:8080/ws?room=${this.roomId}&client_id=${this.username}`;
+					this.socket = new WebSocket(wsUrl);
+
+					this.socket.onopen = () => {
+						this.connected = true;
+					};
+
+					this.socket.onmessage = (event) => {
+						const message = JSON.parse(event.data);
+						if (message.action === 'message') {
+							// Add the message to the messages array
+							this.messages.push(message);
+							
+							// If it's your own message, also show it
+							if (message.from === this.username) {
+								const selfMessage = {...message};
+								this.messages.push(selfMessage);
+							}
+							
+							// Scroll to bottom
+							this.$nextTick(() => {
+								this.$refs.messageContainer.scrollTop = this.$refs.messageContainer.scrollHeight;
+							});
+						}
+					};
+
+					this.socket.onclose = () => {
+						this.connected = false;
+						this.messages = [];
+					};
+				},
+
+				sendMessage() {
+					if (!this.newMessage.trim() || !this.socket) return;
+
+					const message = {
+						action: 'message',
+						content: this.newMessage.trim(),
+						room: this.roomId,
+						from: this.username
+					};
+
+					this.socket.send(JSON.stringify(message));
+					
+					// Add your own message to the messages array
+					this.messages.push({
+						...message,
+						timestamp: new Date().toISOString()
+					});
+					
+					this.newMessage = '';
+				},
+
+				leaveRoom() {
+					if (this.socket) {
+						this.socket.close();
+					}
+					this.connected = false;
+					this.messages = [];
+					this.roomId = '';
+				},
+
+				formatTime(timestamp) {
+					return new Date(timestamp).toLocaleTimeString();
+				}
+			}));
+		});
+	</script>
+</body>
+
+</html>
