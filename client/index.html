@@ -24,7 +24,7 @@
 		<div x-show="!connected" class="flex items-center justify-center h-full">
 			<div class="w-96 bg-white rounded-lg shadow p-6">
 				<h2 class="text-2xl font-bold mb-4">Simple Chat</h2>
-				
+
 				<form @submit.prevent="joinRoom" class="space-y-4">
 					<div>
 						<label class="block text-sm font-medium text-gray-700">Your Name</label>
@@ -54,8 +54,7 @@
 						<h2 class="text-xl font-semibold">Room: <span x-text="roomId"></span></h2>
 						<p class="text-sm">Connected as: <span x-text="username"></span></p>
 					</div>
-					<button @click="leaveRoom"
-						class="px-4 py-2 bg-red-500 text-white rounded-lg hover:bg-red-600">
+					<button @click="leaveRoom" class="px-4 py-2 bg-red-500 text-white rounded-lg hover:bg-red-600">
 						Leave
 					</button>
 				</div>
@@ -64,24 +63,45 @@
 			<!-- Messages Area -->
 			<div class="flex-1 overflow-y-auto p-4 space-y-4 message-container" x-ref="messageContainer">
 				<template x-for="message in messages" :key="message.timestamp">
-					<div :class="message.from === username ? 'message-bubble sent' : 'message-bubble received'">
-						<div class="flex items-baseline space-x-2">
-							<span x-text="message.from" class="font-semibold text-sm"></span>
-							<span x-text="formatTime(message.timestamp)" class="text-xs text-gray-500"></span>
-						</div>
-						<p x-text="message.content" class="mt-1"></p>
+					<div :class="{
+						'message-bubble': message.action === 'message',
+						'system-message': message.action === 'event',
+						'sent': message.from === username,
+						'received': message.from !== username && message.action === 'message'
+					}">
+						<template x-if="message.action === 'message'">
+							<div>
+								<div class="flex items-baseline space-x-2">
+									<span x-text="message.from" class="font-semibold text-sm"></span>
+									<span x-text="formatTime(message.timestamp)" class="text-xs text-gray-500"></span>
+								</div>
+								<p x-text="message.content" class="mt-1"></p>
+							</div>
+						</template>
+						<template x-if="message.action === 'event'">
+							<div class="text-center text-sm text-gray-500">
+								<span x-text="message.from"></span>
+								<span x-text="message.event === 'join' ? ' joined the room' : ' left the room'"></span>
+							</div>
+						</template>
 					</div>
+				</template>
+			</div>
+
+			<!-- Typing Indicator -->
+			<div class="typing-indicator p-2 text-sm text-gray-500" x-show="typingUsers.length > 0">
+				<template x-for="user in typingUsers" :key="user">
+					<span x-text="`${user} is typing...`"></span>
 				</template>
 			</div>
 
 			<!-- Message Input -->
 			<div class="p-4 border-t">
 				<form @submit.prevent="sendMessage" class="flex space-x-2">
-					<input type="text" x-model="newMessage"
+					<input type="text" x-model="newMessage" @input="handleTyping"
 						class="flex-1 rounded-lg border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 px-2"
 						placeholder="Type your message...">
-					<button type="submit"
-						class="px-4 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700">
+					<button type="submit" class="px-4 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700">
 						Send
 					</button>
 				</form>
@@ -98,40 +118,64 @@
 				roomId: '',
 				username: '',
 				newMessage: '',
+				typingUsers: [],
+				typingTimeout: null,
 
 				joinRoom() {
 					if (!this.username) return;
-					
+
 					// Generate room ID if not provided
 					if (!this.roomId) {
 						this.roomId = 'room_' + Math.random().toString(36).substr(2, 9);
 					}
 
-					// Connect to WebSocket
+					// Connect to WebSocket with updated params
 					const wsUrl = `ws://localhost:8080/ws?room=${this.roomId}&client_id=${this.username}`;
 					this.socket = new WebSocket(wsUrl);
 
 					this.socket.onopen = () => {
 						this.connected = true;
+						// Send join event when connected
+						this.socket.send(JSON.stringify({
+							action: 'event',
+							event: 'join',
+							room: this.roomId,
+							from: this.username
+						}));
 					};
 
 					this.socket.onmessage = (event) => {
 						const message = JSON.parse(event.data);
-						if (message.action === 'message') {
-							// Add the message to the messages array
-							this.messages.push(message);
-							
-							// If it's your own message, also show it
-							if (message.from === this.username) {
-								const selfMessage = {...message};
-								this.messages.push(selfMessage);
-							}
-							
-							// Scroll to bottom
-							this.$nextTick(() => {
-								this.$refs.messageContainer.scrollTop = this.$refs.messageContainer.scrollHeight;
-							});
+
+						// Handle different message types
+						switch (message.action) {
+							case 'message':
+								this.messages.push(message);
+								break;
+							case 'event':
+								switch (message.event) {
+									case 'join':
+										this.messages.push(message);
+										break;
+									case 'leave':
+										this.messages.push(message);
+										// Remove from typing users if they were typing
+										this.typingUsers = this.typingUsers.filter(user => user !== message.from);
+										break;
+									case 'typing':
+										this.handleTypingEvent(message);
+										break;
+									case 'users':
+										console.log('Users in room:', message.data.users);
+										break;
+								}
+								break;
 						}
+
+						// Scroll to bottom
+						this.$nextTick(() => {
+							this.$refs.messageContainer.scrollTop = this.$refs.messageContainer.scrollHeight;
+						});
 					};
 
 					this.socket.onclose = () => {
@@ -147,22 +191,29 @@
 						action: 'message',
 						content: this.newMessage.trim(),
 						room: this.roomId,
-						from: this.username
+						from: this.username,
+						timestamp: new Date().toISOString()
 					};
 
 					this.socket.send(JSON.stringify(message));
-					
-					// Add your own message to the messages array
-					this.messages.push({
-						...message,
-						timestamp: new Date().toISOString()
-					});
-					
+					this.messages.push(message); // Add message locally
 					this.newMessage = '';
+
+					// Scroll to bottom
+					this.$nextTick(() => {
+						this.$refs.messageContainer.scrollTop = this.$refs.messageContainer.scrollHeight;
+					});
 				},
 
 				leaveRoom() {
 					if (this.socket) {
+						// Send leave event before closing
+						this.socket.send(JSON.stringify({
+							action: 'event',
+							event: 'leave',
+							room: this.roomId,
+							from: this.username
+						}));
 						this.socket.close();
 					}
 					this.connected = false;
@@ -172,6 +223,44 @@
 
 				formatTime(timestamp) {
 					return new Date(timestamp).toLocaleTimeString();
+				},
+
+				handleTyping() {
+					if (this.typingTimeout) {
+						clearTimeout(this.typingTimeout);
+					}
+
+					// Send typing indicator
+					this.socket.send(JSON.stringify({
+						action: 'event',
+						event: 'typing',
+						room: this.roomId,
+						from: this.username,
+						data: { isTyping: true }
+					}));
+
+					// Clear typing status after 2 seconds of no input
+					this.typingTimeout = setTimeout(() => {
+						this.socket.send(JSON.stringify({
+							action: 'event',
+							event: 'typing',
+							room: this.roomId,
+							from: this.username,
+							data: { isTyping: false }
+						}));
+					}, 2000);
+				},
+
+				handleTypingEvent(message) {
+					if (message.from === this.username) return;
+
+					if (message.data?.isTyping) {
+						if (!this.typingUsers.includes(message.from)) {
+							this.typingUsers.push(message.from);
+						}
+					} else {
+						this.typingUsers = this.typingUsers.filter(user => user !== message.from);
+					}
 				}
 			}));
 		});

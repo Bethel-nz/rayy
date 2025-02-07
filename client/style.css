@@ -15,4 +15,46 @@
 .message-container::-webkit-scrollbar-thumb {
     background-color: rgba(156, 163, 175, 0.5);
     border-radius: 3px;
+}
+
+.system-message {
+    padding: 0.5rem;
+    margin: 0.5rem 0;
+    background-color: #f3f4f6;
+    border-radius: 0.5rem;
+    text-align: center;
+}
+
+.message-bubble {
+    padding: 0.75rem;
+    margin: 0.5rem 0;
+    border-radius: 0.5rem;
+    max-width: 80%;
+}
+
+.message-bubble.sent {
+    margin-left: auto;
+    background-color: #818cf8;
+    color: white;
+}
+
+.message-bubble.received {
+    margin-right: auto;
+    background-color: #e5e7eb;
+}
+
+/* Add to your existing styles */
+.typing-indicator {
+    min-height: 1.5rem;
+    font-style: italic;
+}
+
+.typing-indicator span {
+    display: block;
+    animation: fadeIn 0.3s ease-in;
+}
+
+@keyframes fadeIn {
+    from { opacity: 0; }
+    to { opacity: 1; }
 } 
