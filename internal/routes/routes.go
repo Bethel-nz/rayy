@@ -2,58 +2,115 @@ package routes
 
 import (
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"sync"
 	"time"
 
+	"notkyloren/rayy/internal/config"
 	"notkyloren/rayy/internal/middleware"
 	"notkyloren/rayy/internal/types"
 
 	"github.com/gorilla/websocket"
 )
 
-var upgrader = websocket.Upgrader{
-	ReadBufferSize:  1024,
-	WriteBufferSize: 1024,
-	CheckOrigin: func(r *http.Request) bool {
-		return true // Allow all origins in development
-	},
-}
-
 // Router extends types.Router with WebSocket handling capabilities
 type Router struct {
 	*types.Router
+	config            *config.Config
+	upgrader          websocket.Upgrader
 	roomCleanupTimers map[string]*time.Timer
 	cleanupMu         sync.Mutex
+	shutdown          chan struct{}
+	clients           sync.Map // track all clients for graceful shutdown
 }
 
-func NewRouter() *Router {
+func NewRouter(cfg *config.Config) *Router {
+	if cfg == nil {
+		cfg = config.Load() // Fallback to default config if none provided
+	}
+
 	return &Router{
 		Router: &types.Router{
 			Rooms: make(map[string]*types.Room),
 			Mu:    &sync.RWMutex{},
 		},
+		config: cfg,
+		upgrader: websocket.Upgrader{
+			ReadBufferSize:  cfg.WebSocket.ReadBufferSize,
+			WriteBufferSize: cfg.WebSocket.WriteBufferSize,
+			CheckOrigin: func(r *http.Request) bool {
+				origin := r.Header.Get("Origin")
+				// If "*" is in allowed origins, allow all
+				for _, allowed := range cfg.WebSocket.AllowedOrigins {
+					if allowed == "*" {
+						return true
+					}
+					if origin == allowed {
+						return true
+					}
+				}
+				return false
+			},
+		},
 		roomCleanupTimers: make(map[string]*time.Timer),
+		shutdown:          make(chan struct{}),
 	}
 }
 
 func (router *Router) SetupRoutes() {
-	corsMiddleware := middleware.NewCORS()
-	rateLimiter := middleware.NewRateLimiter()
+	// Use config values for CORS allowed origins
+	corsMiddleware := middleware.NewCORS(router.config.WebSocket.AllowedOrigins...)
+
+	// Use configuration values for rate limiting
+	rateLimiter := middleware.NewRateLimiter(
+		router.config.RateLimit.Requests,
+		router.config.RateLimit.Duration,
+	)
 
 	http.HandleFunc("/ws", corsMiddleware.CORS(
 		rateLimiter.RateLimit(router.handleWebSocket),
 	))
 }
 
+// GracefulShutdown handles the graceful shutdown of all connections
+func (router *Router) GracefulShutdown() {
+	// Signal all goroutines to stop
+	close(router.shutdown)
+
+	// Send close message to all clients
+	router.clients.Range(func(k, v interface{}) bool {
+		client, ok := v.(*types.Client)
+		if ok && client != nil && client.Conn != nil {
+			// Try to send close message
+			client.WriteMu.Lock()
+			client.Conn.WriteMessage(
+				websocket.CloseMessage,
+				websocket.FormatCloseMessage(websocket.CloseGoingAway, "Server shutting down"),
+			)
+			client.WriteMu.Unlock()
+			client.Conn.Close()
+		}
+		return true
+	})
+
+	// Give clients time to receive and process the close message
+	time.Sleep(500 * time.Millisecond)
+
+	slog.Info("All WebSocket connections closed")
+}
+
 // handleWebSocket manages the WebSocket connection lifecycle
 func (router *Router) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	client, room, err := router.setupConnection(w, r)
 	if err != nil {
-		log.Printf("Connection setup failed: %v", err)
+		slog.Error("Connection setup failed", "error", err)
 		return
 	}
+
+	// Store client for graceful shutdown
+	router.clients.Store(client.ID, client)
+	defer router.clients.Delete(client.ID)
 
 	// Create a done channel to coordinate cleanup
 	done := make(chan struct{})
@@ -65,10 +122,11 @@ func (router *Router) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		done <- struct{}{} // Signal that handling is complete
 	}()
 
-	// Wait for either done signal or context cancellation
+	// Wait for either done signal, context cancellation, or server shutdown
 	select {
 	case <-done:
 	case <-r.Context().Done():
+	case <-router.shutdown:
 	}
 
 	// Cleanup after everything is done
@@ -85,16 +143,36 @@ func (router *Router) setupConnection(w http.ResponseWriter, r *http.Request) (*
 		return nil, nil, fmt.Errorf("missing parameters")
 	}
 
-	conn, err := upgrader.Upgrade(w, r, nil)
+	conn, err := router.upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		return nil, nil, fmt.Errorf("upgrade failed: %v", err)
 	}
 
+	// Set connection parameters
+	conn.SetReadLimit(int64(router.config.WebSocket.MaxMessageSizeKB * 1024))
+	conn.SetReadDeadline(time.Now().Add(time.Duration(router.config.WebSocket.PongWaitSec) * time.Second))
+	conn.SetPongHandler(func(string) error {
+		conn.SetReadDeadline(time.Now().Add(time.Duration(router.config.WebSocket.PongWaitSec) * time.Second))
+		return nil
+	})
+
 	room := router.getOrCreateRoom(roomID)
+
+	// Check if room is full
+	room.Mu.RLock()
+	if len(room.Clients) >= router.config.Room.MaxClients {
+		room.Mu.RUnlock()
+		conn.Close()
+		return nil, nil, fmt.Errorf("room %s is at capacity", roomID)
+	}
+	room.Mu.RUnlock()
+
 	client := &types.Client{
-		ID:   clientID,
-		Conn: conn,
-		Room: room,
+		ID:      clientID,
+		Conn:    conn,
+		Room:    room,
+		WriteMu: &sync.Mutex{},
+		Send:    make(chan types.Message, 256),
 	}
 
 	// Cancel any pending cleanup when a client joins
@@ -102,6 +180,12 @@ func (router *Router) setupConnection(w http.ResponseWriter, r *http.Request) (*
 
 	// Add client to room
 	router.addClientToRoom(client, room)
+
+	// Start the writer pump
+	go router.writerPump(client)
+
+	// Start the ping ticker
+	go router.pingClient(client)
 
 	// Send join notification to all other clients
 	joinMsg := types.Message{
@@ -113,7 +197,65 @@ func (router *Router) setupConnection(w http.ResponseWriter, r *http.Request) (*
 	}
 	router.broadcastToRoom(room, joinMsg, client)
 
+	slog.Info("Client connected",
+		"client_id", client.ID,
+		"room_id", room.ID,
+		"remote_addr", r.RemoteAddr,
+		"user_agent", r.UserAgent(),
+	)
+
 	return client, room, nil
+}
+
+// pingClient periodically sends ping messages to keep the connection alive
+func (router *Router) pingClient(client *types.Client) {
+	ticker := time.NewTicker(time.Duration(router.config.WebSocket.PingIntervalSec) * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			client.WriteMu.Lock()
+			client.Conn.SetWriteDeadline(time.Now().Add(time.Duration(router.config.WebSocket.WriteWaitSec) * time.Second))
+			if err := client.Conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				client.WriteMu.Unlock()
+				return
+			}
+			client.WriteMu.Unlock()
+		case <-router.shutdown:
+			return
+		}
+	}
+}
+
+// writerPump pumps messages from the client's send channel to the websocket connection
+func (router *Router) writerPump(client *types.Client) {
+	for {
+		select {
+		case msg, ok := <-client.Send:
+			client.WriteMu.Lock()
+			client.Conn.SetWriteDeadline(time.Now().Add(time.Duration(router.config.WebSocket.WriteWaitSec) * time.Second))
+			if !ok {
+				// Channel was closed
+				client.Conn.WriteMessage(websocket.CloseMessage, []byte{})
+				client.WriteMu.Unlock()
+				return
+			}
+
+			if err := client.Conn.WriteJSON(msg); err != nil {
+				slog.Error("Failed to write message",
+					"client_id", client.ID,
+					"room_id", client.Room.ID,
+					"error", err,
+				)
+				client.WriteMu.Unlock()
+				return
+			}
+			client.WriteMu.Unlock()
+		case <-router.shutdown:
+			return
+		}
+	}
 }
 
 // getOrCreateRoom returns an existing room or creates a new one
@@ -139,8 +281,11 @@ func (router *Router) addClientToRoom(client *types.Client, room *types.Room) {
 	defer room.Mu.Unlock()
 
 	room.Clients[client.ID] = client
-	log.Printf("Client %s joined room %s. Total clients: %d",
-		client.ID, room.ID, len(room.Clients))
+	slog.Info("Client joined room",
+		"client_id", client.ID,
+		"room_id", room.ID,
+		"total_clients", len(room.Clients),
+	)
 }
 
 // cleanupConnection handles cleanup when a client disconnects
@@ -153,7 +298,7 @@ func (router *Router) cleanupConnection(client *types.Client, room *types.Room) 
 	room.Mu.Lock()
 	if _, exists := room.Clients[client.ID]; exists {
 		delete(room.Clients, client.ID)
-		log.Printf("Client %s left room %s", client.ID, room.ID)
+		slog.Info("Client left room", "client_id", client.ID, "room_id", room.ID)
 
 		// If room is empty, schedule cleanup
 		if len(room.Clients) == 0 {
@@ -183,19 +328,28 @@ func (router *Router) cleanupConnection(client *types.Client, room *types.Room) 
 // handleMessages processes incoming messages
 func (router *Router) handleMessages(client *types.Client, room *types.Room) {
 	for {
-		var msg types.Message
-		if err := client.Conn.ReadJSON(&msg); err != nil {
-			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-				log.Printf("Error reading message from client %s: %v", client.ID, err)
+		select {
+		case <-router.shutdown:
+			return
+		default:
+			var msg types.Message
+			if err := client.Conn.ReadJSON(&msg); err != nil {
+				if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+					slog.Error("Error reading message",
+						"client_id", client.ID,
+						"room_id", room.ID,
+						"error", err,
+					)
+				}
+				return
 			}
-			break
+
+			msg.From = client.ID
+			msg.Room = room.ID
+			msg.Timestamp = time.Now()
+
+			router.handleMessage(client, room, msg)
 		}
-
-		msg.From = client.ID
-		msg.Room = room.ID
-		msg.Timestamp = time.Now()
-
-		router.handleMessage(client, room, msg)
 	}
 }
 
@@ -206,6 +360,13 @@ func (router *Router) handleMessage(client *types.Client, room *types.Room, msg 
 		router.broadcastToRoom(room, msg, client)
 	case "event":
 		router.handleEvent(client, room, msg)
+	default:
+		// Log unknown message types but don't crash
+		slog.Warn("Unknown message action",
+			"action", msg.Action,
+			"client_id", client.ID,
+			"room_id", room.ID,
+		)
 	}
 }
 
@@ -241,7 +402,7 @@ func (router *Router) sendUserList(client *types.Client, room *types.Room) {
 			"users": users,
 		},
 	}
-	client.Conn.WriteJSON(msg)
+	client.Send <- msg
 }
 
 // broadcastToRoom sends a message to all clients in a room except the sender
@@ -256,19 +417,28 @@ func (router *Router) broadcastToRoom(room *types.Room, msg types.Message, sende
 	}
 	room.Mu.RUnlock()
 
-	// Broadcast without cleanup - just log errors
-	for id, client := range clients {
-		client.WriteMu.Lock()
-		err := client.Conn.WriteJSON(msg)
-		client.WriteMu.Unlock()
+	// Count errors to handle problematic connections
+	var errorCount sync.Map
 
-		if err != nil {
-			if !websocket.IsCloseError(err,
-				websocket.CloseNormalClosure,
-				websocket.CloseGoingAway,
-				websocket.CloseNoStatusReceived) {
-				// Only log unexpected errors
-				log.Printf("Failed to broadcast to client %s: %v", id, err)
+	// Broadcast without blocking - use the send channel
+	for id, client := range clients {
+		// Non-blocking send to channel
+		select {
+		case client.Send <- msg:
+			// Message sent successfully
+		default:
+			// Channel is full, client might be slow or unresponsive
+			// Record as error for potential cleanup
+			count, _ := errorCount.LoadOrStore(id, 1)
+			if count.(int) >= 5 {
+				// Too many errors, clean up this client
+				slog.Warn("Client send buffer full, disconnecting",
+					"client_id", id,
+					"room_id", room.ID,
+				)
+				client.Conn.Close() // Force close to trigger normal cleanup
+			} else {
+				errorCount.Store(id, count.(int)+1)
 			}
 		}
 	}
@@ -285,7 +455,8 @@ func (router *Router) scheduleRoomCleanup(roomID string) {
 	}
 
 	// Set new timer
-	router.roomCleanupTimers[roomID] = time.AfterFunc(30*time.Second, func() {
+	cleanupTime := time.Duration(router.config.Room.CleanupTimeoutSec) * time.Second
+	router.roomCleanupTimers[roomID] = time.AfterFunc(cleanupTime, func() {
 		router.cleanupMu.Lock()
 		delete(router.roomCleanupTimers, roomID)
 		router.cleanupMu.Unlock()
@@ -295,7 +466,7 @@ func (router *Router) scheduleRoomCleanup(roomID string) {
 			room.Mu.Lock()
 			if len(room.Clients) == 0 {
 				delete(router.Rooms, roomID)
-				log.Printf("Room %s removed after timeout", roomID)
+				slog.Info("Room removed after timeout", "room_id", roomID)
 			}
 			room.Mu.Unlock()
 		}
